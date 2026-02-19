@@ -1,93 +1,158 @@
-import os
-import sys
-import smtplib
+import argparse
+import csv
 import getpass
+import logging
+import os
+import smtplib
+import sys
+import time
 from email.message import EmailMessage
+from pathlib import Path
+from typing import Optional
 
-# Load simple .env (KEY=VALUE) if present
-if os.path.exists('.env'):
+
+def load_dotenv(path: str = ".env") -> None:
+    """Load a simple KEY=VALUE .env file into os.environ without overwriting existing values."""
+    p = Path(path)
+    if not p.exists():
+        return
     try:
-        with open('.env', 'r', encoding='utf-8') as fh:
+        with p.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if not line or line.startswith('#') or '=' not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
-                k, v = line.split('=', 1)
+                k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     except Exception:
-        pass
+        # Do not raise; silently ignore malformed .env in production usage
+        return
 
-S = os.environ.get('SENDER_EMAIL') or input('Sender: ')
-P = os.environ.get('SMTP_PASSWORD') or os.environ.get('APP_PASSWORD') or getpass.getpass('Password: ')
-R = os.environ.get('RECEIVER_EMAIL') or input('Receiver: ')
-SUB = os.environ.get('SUBJECT', 'Test email')
-BODY = os.environ.get('BODY', 'Hello from Python')
 
-msg = EmailMessage()
-msg['From'], msg['To'], msg['Subject'] = S, R, SUB
-plain_body = BODY
+def build_message(sender: str, receiver: str, subject: str, body: str, table_path: Optional[Path] = None) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = receiver
+    msg["Subject"] = subject
+    plain_body = body
 
-# If a table file exists (table.csv or table.tsv) include it in the message as HTML table
-table_path = None
-for candidate in ('table.csv', 'table.tsv'):
-    if os.path.exists(candidate):
-        table_path = candidate
-        break
-
-if table_path:
-    # build a simple HTML table from the CSV/TSV
-    import csv
-    dialect = 'excel' if table_path.endswith('.csv') else 'excel-tab'
-    rows = []
-    try:
-        with open(table_path, newline='', encoding='utf-8') as fh:
-            reader = csv.reader(fh, dialect=dialect)
-            for r in reader:
-                rows.append(r)
-    except Exception:
+    if table_path and table_path.exists():
+        dialect = "excel" if table_path.suffix == ".csv" else "excel-tab"
         rows = []
+        try:
+            with table_path.open("r", newline="", encoding="utf-8") as fh:
+                reader = csv.reader(fh, dialect=dialect)
+                for r in reader:
+                    rows.append(r)
+        except Exception:
+            rows = []
 
-    if rows:
-        # prepare HTML
-        cols = rows[0]
-        html = ['<html><body>', f'<p>{BODY}</p>', '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">']
-        # header
-        html.append('<thead><tr>')
-        for c in cols:
-            html.append(f'<th style="background:#eee">{c}</th>')
-        html.append('</tr></thead>')
-        # body rows
-        html.append('<tbody>')
-        for row in rows[1:]:
-            html.append('<tr>')
-            for cell in row:
-                html.append(f'<td>{cell}</td>')
-            html.append('</tr>')
-        html.append('</tbody></table></body></html>')
-        html_body = '\n'.join(html)
-        msg.set_content(plain_body)
-        msg.add_alternative(html_body, subtype='html')
-    else:
-        msg.set_content(plain_body)
-else:
+        if rows:
+            cols = rows[0]
+            html = ["<html><body>", f"<p>{body}</p>", '<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">']
+            html.append("<thead><tr>")
+            for c in cols:
+                html.append(f"<th style=\"background:#eee\">{c}</th>")
+            html.append("</tr></thead>")
+            html.append("<tbody>")
+            for row in rows[1:]:
+                html.append("<tr>")
+                for cell in row:
+                    html.append(f"<td>{cell}</td>")
+                html.append("</tr>")
+            html.append("</tbody></table></body></html>")
+            html_body = "\n".join(html)
+            msg.set_content(plain_body)
+            msg.add_alternative(html_body, subtype="html")
+            return msg
+
     msg.set_content(plain_body)
+    return msg
 
-print('\nPreview:')
-print('From:', S)
-print('To:  ', R)
-print('Subject:', SUB)
-print('\n' + BODY + '\n')
 
-if '--send' not in sys.argv:
-    print('No --send flag: not sending. Run with --send to actually send.')
-    sys.exit(0)
+def send_email_from_env(subject: str, body: str, table_path: Optional[Path] = None, *, smtp_host: str = "smtp.gmail.com", smtp_port: int = 587, timeout: int = 20, max_retries: int = 3) -> None:
+    """Send an email using credentials from environment variables.
 
-try:
-    with smtplib.SMTP('smtp.gmail.com', 587, timeout=20) as s:
-        s.starttls()
-        s.login(S, P)
-        s.send_message(msg)
-    print('Email sent')
-except Exception as e:
-    print('Send failed:', e)
-    sys.exit(1)
+    Required environment variables:
+      - SENDER_EMAIL
+      - RECEIVER_EMAIL
+      - SMTP_PASSWORD (an App Password for Gmail when using Gmail)
+
+    This function performs a small retry loop for transient failures and
+    logs errors instead of printing sensitive information.
+    """
+    sender = os.environ.get("SENDER_EMAIL")
+    receiver = os.environ.get("RECEIVER_EMAIL")
+    password = os.environ.get("SMTP_PASSWORD") or os.environ.get("APP_PASSWORD")
+
+    if not sender or not receiver:
+        raise RuntimeError("SENDER_EMAIL and RECEIVER_EMAIL must be set in environment")
+    if not password:
+        # For non-interactive/automated runs we require password in env (use Secret Manager in prod)
+        raise RuntimeError("SMTP_PASSWORD (App Password) must be set in environment for automated sending")
+
+    msg = build_message(sender, receiver, subject, body, table_path)
+
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=timeout) as s:
+                s.starttls()
+                s.login(sender, password)
+                s.send_message(msg)
+            logging.info("Email sent to %s", receiver)
+            return
+        except smtplib.SMTPException as exc:
+            last_exc = exc
+            logging.warning("SMTP attempt %d failed: %s", attempt, exc)
+            # simple backoff
+            time.sleep(2 ** attempt)
+        except Exception as exc:
+            last_exc = exc
+            logging.exception("Unexpected error while sending email: %s", exc)
+            time.sleep(1)
+
+    # If we get here, all retries failed
+    raise RuntimeError("Failed to send email after retries") from last_exc
+
+
+def _cli_main(argv: Optional[list[str]] = None) -> int:
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Send a report email. Uses .env for credentials by default.")
+    parser.add_argument("--send", action="store_true", help="Actually send the email (otherwise preview only)")
+    parser.add_argument("--subject", help="Email subject (overrides SUBJECT env)")
+    parser.add_argument("--body", help="Email body (overrides BODY env)")
+    parser.add_argument("--table", help="Path to CSV/TSV table to attach (default: auto-detect)")
+    args = parser.parse_args(argv)
+
+    subject = args.subject or os.environ.get("SUBJECT", "Report from alerting_mail")
+    body = args.body or os.environ.get("BODY", "Please find the attached report.")
+
+    # choose table path: explicit, or detect table.csv/table.tsv in cwd
+    table_path = None
+    if args.table:
+        table_path = Path(args.table)
+    else:
+        for candidate in ("table.csv", "table.tsv"):
+            if Path(candidate).exists():
+                table_path = Path(candidate)
+                break
+
+    print("\nPreview:")
+    print("Subject:", subject)
+    print(body)
+    if not args.send:
+        print("\nNo --send flag: not sending. Run with --send to actually send.")
+        return 0
+
+    send_email_from_env(subject, body, table_path)
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    try:
+        raise SystemExit(_cli_main())
+    except Exception as e:
+        logging.exception("Error: %s", e)
+        raise

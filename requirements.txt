@@ -1,0 +1,2 @@
+# No third-party Python libraries required. This project uses only the Python stdlib
+# and GCP-hosted services (metadata server or gcloud auth) for authentication.
